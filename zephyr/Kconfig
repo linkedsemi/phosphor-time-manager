@@ -1,0 +1,33 @@
+config OPENBMC_PHOSPHOR_TIME_MANAGER
+    bool "openbmc phosphor time manager"
+    
+choice OPENBMC_PHOSPHOR_TIME_MANAGER_DEFAULT_MODE
+    prompt "default time sync method"
+    default OPENBMC_PHOSPHOR_TIME_MANAGER_DEFAULT_MODE_NTP
+    depends on OPENBMC_PHOSPHOR_TIME_MANAGER
+
+config OPENBMC_PHOSPHOR_TIME_MANAGER_DEFAULT_MODE_NTP
+    bool "NTP"
+
+config OPENBMC_PHOSPHOR_TIME_MANAGER_DEFAULT_MODE_MANUAL
+    bool "Manual"
+
+endchoice
+
+config OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_SERVER
+    string
+    prompt "NTP server address (empty = NTP sync disabled)"
+    default ""
+    depends on OPENBMC_PHOSPHOR_TIME_MANAGER
+    help
+      NTP server address, either an IPv4 literal or a host name. Leave it
+      empty to disable NTP sync; the thread in zephyr/ntp_time.c then exits.
+
+config OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT
+    int
+    prompt "NTP server UDP port"
+    default 123
+    depends on OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_SERVER != ""
+    help
+      The standard NTP port is 123. Change it when that port is taken on the
+      server side.

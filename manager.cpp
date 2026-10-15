@@ -72,6 +72,16 @@ void Manager::updateNtpSetting(const std::string& value)
 {
     try
     {
+        // An empty mode means the setting could not be read, not that manual
+        // was chosen. The mapper only learns about the settings service
+        // through InterfacesAdded, so at boot this can arrive before that
+        // service is known. Treating it as manual would send SetNTP(false)
+        // and silently disable sync until the next reboot.
+        if (value.empty())
+        {
+            return;
+        }
+
         bool isNtp =
             (value == "xyz.openbmc_project.Time.Synchronization.Method.NTP");
         auto method = bus.new_method_call(systemdTimeService, systemdTimePath,
