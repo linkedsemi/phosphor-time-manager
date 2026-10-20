@@ -51,15 +51,51 @@ void ntp_config_register(sdbusplus::asio::connection& bus,
 			"/xyz/openbmc_project/network/eth0",
 			"xyz.openbmc_project.Network.EthernetInterface");
 
+		/* Start from the list restored from disk, not from empty:
+		 * otherwise a reboot makes the page read back "no server" while
+		 * the saved ones are still in use. */
+		std::vector<std::string> initial;
+		char restored[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
+		int restoredCount =
+			ntp_get_user_servers(restored, NTP_MAX_SERVERS);
+		for (int i = 0; i < restoredCount; i++) {
+			initial.emplace_back(restored[i]);
+		}
+
 		iface->register_property_rw<std::vector<std::string>>(
-			"StaticNTPServers", std::vector<std::string>{},
+			"StaticNTPServers", initial,
 			sdbusplus::vtable::property_::emits_change,
 			[](const std::vector<std::string>& req,
 			   std::vector<std::string>& cur) {
-				/* Only the first address is used; there is a
-				 * single sync thread. */
-				ntp_set_user_server(
-					req.empty() ? nullptr : req[0].c_str());
+				/* Reject anything the sync thread cannot use as
+				 * given. Truncating or dropping an entry would
+				 * leave the property showing one list while the
+				 * thread queries another, which is impossible to
+				 * diagnose from the page. Returning false makes
+				 * sd-bus answer InvalidArgs, which bmcweb turns
+				 * into a Redfish error the UI can show. */
+				if (req.size() > NTP_MAX_SERVERS) {
+					return false;
+				}
+
+				std::vector<const char*> ptrs;
+				ptrs.reserve(req.size());
+				for (const auto& s : req) {
+					/* Empty; too long for the fixed-size
+					 * slots; or carrying a newline, which
+					 * would split into two entries in the
+					 * one-per-line persisted file. */
+					if (s.empty() ||
+					    s.size() >= NTP_USER_SERVER_MAX ||
+					    s.find_first_of("\r\n") !=
+						    std::string::npos) {
+						return false;
+					}
+					ptrs.push_back(s.c_str());
+				}
+				ntp_set_user_servers(
+					ptrs.data(),
+					static_cast<int>(ptrs.size()));
 
 				cur = req;
 				return true;

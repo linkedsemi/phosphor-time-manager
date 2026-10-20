@@ -1,8 +1,10 @@
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/rtc.h>
+#include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/sntp.h>
@@ -22,13 +24,149 @@ static const char ntp_server[] = CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_SERVER
  * a manually set time is not overwritten. */
 extern bool ntp_is_enabled(void);
 
-/* Address set from the web UI / Redfish, written by ntp_config.cpp through
- * ntp_set_user_server(). Empty means unset, and ntp_server above is used.
+/* Addresses set from the web UI / Redfish, in the order they were given,
+ * written by ntp_config.cpp through ntp_set_user_servers(). The count is 0
+ * when nothing is set, and ntp_server above is then the only server.
  *
  * Kept in this C file rather than ntp_config.cpp so K_MUTEX_DEFINE stays in C,
  * where its designated initialiser is less compiler-sensitive. */
-static char userServer[NTP_USER_SERVER_MAX];
+static char userServer[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
+static int userServerCount;
 static K_MUTEX_DEFINE(userServerLock);
+
+/* The list is saved under /overlay, the writable filesystem on this image
+ * (there is no /var), one address per line. It is written on every change,
+ * which only happens when a user sets one, so the blocking littlefs write is
+ * not on a hot path. */
+#define NTP_USER_SERVER_DIR  "/overlay/var/lib/phosphor-time-manager"
+#define NTP_USER_SERVER_PATH NTP_USER_SERVER_DIR "/ntp_server"
+
+/* fs_write() is allowed to return fewer bytes than asked for. littlefs does not
+ * do that today, but a partial write would glue two addresses together in the
+ * one-per-line file, so insist on the full length every time. */
+static bool write_all(struct fs_file_t *f, const char *data, size_t len)
+{
+	return fs_write(f, data, len) == (ssize_t)len;
+}
+
+static void save_user_servers(const char list[][NTP_USER_SERVER_MAX],
+			      int count)
+{
+	struct fs_file_t f;
+	bool ok = true;
+	int closed;
+	int i;
+
+	fs_file_t_init(&f);
+
+	/* -EEXIST when it is already there, which is the normal case. */
+	(void)fs_mkdir(NTP_USER_SERVER_DIR);
+
+	if (fs_open(&f, NTP_USER_SERVER_PATH,
+		    FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC) != 0) {
+		printk("[ntp] cannot save the server list; keeping the previous "
+		       "one\n");
+		return;
+	}
+
+	for (i = 0; i < count && ok; i++) {
+		ok = write_all(&f, list[i], strlen(list[i])) &&
+		     write_all(&f, "\n", 1);
+	}
+
+	closed = fs_close(&f);
+
+	/* littlefs commits on close, so a failure there matters as much. */
+	if (!ok || closed != 0) {
+		/* The file was truncated when it was opened and is now only
+		 * partly written. Keeping it would make the next boot restore a
+		 * truncated list, so drop it: the Kconfig default is a better
+		 * answer than a list nobody typed. */
+		(void)fs_unlink(NTP_USER_SERVER_PATH);
+		printk("[ntp] cannot save the server list (%d); removed the saved "
+		       "one so the built-in server is used after a reboot\n",
+		       closed);
+		printk("[ntp] set the servers again in the web UI (Settings -> "
+		       "Date & Time) to retry saving them\n");
+	}
+}
+
+/* Set once the file has been looked at, so the sync thread and the property
+ * initialiser can both ask for it without racing or re-reading. */
+static bool userServersLoaded;
+
+/* Restore the list saved by a previous run. The sync thread calls it before its
+ * first round; ntp_get_user_servers() calls it too, so the property does not
+ * depend on who runs first. */
+static void load_user_servers(void)
+{
+	struct fs_file_t f;
+	char buf[NTP_MAX_SERVERS * (NTP_USER_SERVER_MAX + 1)];
+	ssize_t n;
+	char *line;
+	int count = 0;
+	int rc;
+
+	if (userServersLoaded) {
+		return;
+	}
+	userServersLoaded = true;
+
+	fs_file_t_init(&f);
+
+	rc = fs_open(&f, NTP_USER_SERVER_PATH, FS_O_READ);
+	if (rc != 0) {
+		/* -ENOENT just means nothing has been saved yet. */
+		if (rc != -ENOENT) {
+			printk("[ntp] cannot read the saved server list (%d)\n",
+			       rc);
+		}
+		return;
+	}
+	n = fs_read(&f, buf, sizeof(buf) - 1);
+	fs_close(&f);
+	if (n < 0) {
+		printk("[ntp] cannot read the saved server list (%d)\n", (int)n);
+		return;
+	}
+	if (n == 0) {
+		return; /* empty file */
+	}
+	buf[n] = '\0';
+
+	k_mutex_lock(&userServerLock, K_FOREVER);
+
+	line = buf;
+	while (*line != '\0' && count < NTP_MAX_SERVERS) {
+		char *eol = strchr(line, '\n');
+		size_t len;
+
+		if (eol != NULL) {
+			*eol = '\0';
+		}
+
+		/* Tolerate CRLF in case the file was edited elsewhere. */
+		len = strlen(line);
+		if (len > 0 && line[len - 1] == '\r') {
+			line[len - 1] = '\0';
+		}
+
+		if (line[0] != '\0') {
+			snprintf(userServer[count], NTP_USER_SERVER_MAX, "%s",
+				 line);
+			printk("[ntp] restored server %s\n", userServer[count]);
+			count++;
+		}
+
+		if (eol == NULL) {
+			break;
+		}
+		line = eol + 1;
+	}
+
+	userServerCount = count;
+	k_mutex_unlock(&userServerLock);
+}
 
 /* The sync thread sleeps NTP_RESYNC_SEC between rounds. Changing the server
  * address or toggling NTP should take effect immediately, so the sleep is a
@@ -44,45 +182,78 @@ void ntp_wake(void)
 	k_sem_give(&ntp_wake_sem);
 }
 
-void ntp_set_user_server(const char *server)
+void ntp_set_user_servers(const char *const *servers, int count)
 {
+	char snapshot[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
+	int n = 0;
+	int i;
+
 	k_mutex_lock(&userServerLock, K_FOREVER);
-	if (server == NULL || server[0] == '\0') {
-		userServer[0] = '\0';
-	} else {
-		snprintf(userServer, sizeof(userServer), "%s", server);
+	for (i = 0; i < count && n < NTP_MAX_SERVERS; i++) {
+		if (servers[i] == NULL || servers[i][0] == '\0') {
+			continue;
+		}
+		snprintf(userServer[n], NTP_USER_SERVER_MAX, "%s", servers[i]);
+		n++;
+	}
+	userServerCount = n;
+	for (i = 0; i < n; i++) {
+		snprintf(snapshot[i], NTP_USER_SERVER_MAX, "%s", userServer[i]);
 	}
 	k_mutex_unlock(&userServerLock);
 
-	printk("[ntp] user server <- %s\n",
-	       (server == NULL || server[0] == '\0') ? "(cleared)" : server);
+	/* Write outside the lock: this blocks on flash, and the sync thread
+	 * only needs the lock for the duration of a copy. Only the timedated io
+	 * thread calls this today, so two saves cannot interleave; if a second
+	 * caller ever appears, give save_user_servers() its own mutex. */
+	save_user_servers(snapshot, n);
+
+	printk("[ntp] user servers <-");
+	if (n == 0) {
+		printk(" (cleared)\n");
+	} else {
+		for (i = 0; i < n; i++) {
+			printk(" %s", snapshot[i]);
+		}
+		printk("\n");
+	}
 
 	ntp_wake();
 }
 
-/* Copy the user address out. Returns true when one is set and buf is valid. */
-static bool user_server_snapshot(char *buf, size_t len)
+int ntp_get_user_servers(char out[][NTP_USER_SERVER_MAX], int max)
 {
-	bool found = false;
+	int n;
+	int i;
 
-	if (len == 0) {
-		return false;
-	}
+	/* The sync thread loads at start-up, but the property initialiser runs
+	 * on the io thread; load here as well so it never reports an empty list
+	 * just because it got there first. */
+	load_user_servers();
 
 	k_mutex_lock(&userServerLock, K_FOREVER);
-	if (userServer[0] != '\0') {
-		snprintf(buf, len, "%s", userServer);
-		found = true;
+	n = (userServerCount < max) ? userServerCount : max;
+	for (i = 0; i < n; i++) {
+		snprintf(out[i], NTP_USER_SERVER_MAX, "%s", userServer[i]);
 	}
 	k_mutex_unlock(&userServerLock);
 
-	return found;
+	return n;
 }
 
 #define NTP_TIMEOUT_MS   3000 /* per-query timeout */
 #define NTP_RESYNC_SEC   3600 /* interval after a successful sync */
 #define NTP_RETRY_SEC    10   /* interval after a failure */
 #define NTP_NET_WAIT_SEC 5    /* network poll interval */
+
+/* An unreachable server is retried forever, but the rate changes: the first few
+ * attempts run every NTP_RETRY_SEC and are reported, because a console line
+ * every 10 s floods everything else. Once those are spent the thread drops to
+ * NTP_SLOW_RETRY_SEC and says so once, pointing at the web UI. It keeps
+ * retrying quietly, so a network that comes back is picked up within one slow
+ * period instead of needing the user to do anything. */
+#define NTP_LOUD_FAILURES   3
+#define NTP_SLOW_RETRY_SEC  3600 /* 1 h */
 
 /* Accepted range for the time received over NTP. The bounds are the limits of
  * the IPMI SEL timestamp field, which is a uint32 count of seconds since 1970;
@@ -221,25 +392,36 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 {
 	struct sntp_time ts;
 	struct timespec tspec;
+	int failures = 0; /* consecutive failed rounds; drives how loud the log is */
 
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	/* Nothing to do without a default server. */
-	if (sizeof(ntp_server) == 1) {
-		printk("[ntp] NTP_SERVER not configured, disabled\n");
-		return;
-	}
+	/* Bring back the list a previous run saved, before the first sync. */
+	load_user_servers();
 
-	printk("[ntp] default server %s:%d\n", ntp_server,
-	       CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT);
+	/* Without a built-in default the thread is still useful when a saved
+	 * list exists, so give up only if both are missing. */
+	if (sizeof(ntp_server) == 1) {
+		char saved[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
+
+		if (ntp_get_user_servers(saved, NTP_MAX_SERVERS) == 0) {
+			printk("[ntp] NTP_SERVER not configured, disabled\n");
+			return;
+		}
+		printk("[ntp] no default server, using the saved list\n");
+	} else {
+		printk("[ntp] default server %s:%d\n", ntp_server,
+		       CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT);
+	}
 
 	for (;;) {
 		uint32_t wait_sec = NTP_RESYNC_SEC;
-		char userbuf[NTP_USER_SERVER_MAX];
+		char userbuf[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
 		const char *host;
-		bool from_user;
+		int n_user;
+		int i;
 		int rc;
 
 		/* Skip while NTP is switched off (manual mode). */
@@ -265,23 +447,50 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		 * not take effect for a full resync period. */
 		k_sem_reset(&ntp_wake_sem);
 
-		/* The user address wins when set; otherwise the Kconfig default. */
-		from_user = user_server_snapshot(userbuf, sizeof(userbuf));
-		host = from_user ? userbuf : ntp_server;
+		/* The user's addresses win when set, tried in the order they
+		 * were given; the built-in one is only used when none of them
+		 * answers. */
+		n_user = ntp_get_user_servers(userbuf, NTP_MAX_SERVERS);
+		host = ntp_server;
+		rc = -EINVAL;
 
-		rc = query_once(host, &ts);
+		for (i = 0; i < n_user; i++) {
+			rc = query_once(userbuf[i], &ts);
+			if (rc == 0) {
+				host = userbuf[i];
+				break;
+			}
+			printk("[ntp] %s unreachable (%d)\n", userbuf[i], rc);
+		}
 
-		/* User server unreachable -- try the built-in address once. */
-		if (rc != 0 && from_user) {
-			printk("[ntp] user server %s unreachable, fallback to %s\n",
-			       host, ntp_server);
+		/* Only worth falling back when a built-in server exists. */
+		if (rc != 0 && sizeof(ntp_server) > 1) {
+			if (n_user > 0) {
+				printk("[ntp] no user server answered, fallback to %s\n",
+				       ntp_server);
+			}
 			host = ntp_server;
 			rc = query_once(host, &ts);
 		}
 
 		if (rc != 0) {
-			printk("[ntp] query failed, retry in %ds\n", NTP_RETRY_SEC);
-			wait_sec = NTP_RETRY_SEC;
+			failures++;
+			if (failures <= NTP_LOUD_FAILURES) {
+				printk("[ntp] query failed (%d/%d), retry in %ds\n",
+				       failures, NTP_LOUD_FAILURES, NTP_RETRY_SEC);
+				wait_sec = NTP_RETRY_SEC;
+			} else {
+				if (failures == NTP_LOUD_FAILURES + 1) {
+					printk("[ntp] no NTP server is reachable; "
+					       "switching to slow mode and retrying "
+					       "every %d min\n",
+					       NTP_SLOW_RETRY_SEC / 60);
+					printk("[ntp] set a server in the web UI "
+					       "(Settings -> Date & Time) to sync "
+					       "right away\n");
+				}
+				wait_sec = NTP_SLOW_RETRY_SEC;
+			}
 		} else if (ts.seconds < NTP_MIN_VALID_EPOCH ||
 			   ts.seconds > NTP_MAX_VALID_EPOCH) {
 			/* Implausible value: no system time, and no RTC write. */
@@ -305,6 +514,7 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 			} else {
 				printk("[ntp] synced to %llu via %s\n",
 				       (unsigned long long)ts.seconds, host);
+				failures = 0;
 				write_rtc_from_system();
 			}
 		}
@@ -312,8 +522,14 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		/* Returns 0 when woken by ntp_wake(), -EAGAIN on timeout. */
 		if (k_sem_take(&ntp_wake_sem, K_SECONDS(wait_sec)) == 0) {
 			printk("[ntp] woken, resync now\n");
+			/* The user changed the address or the switch, so the
+			 * next failures deserve to be reported again. */
+			failures = 0;
 		}
 	}
 }
 
-K_THREAD_DEFINE(ntp_sync_tid, 4096, ntp_sync_thread, NULL, NULL, NULL, 7, 0, 0);
+/* 8192, not 4096: the deepest path is the start-up restore, which runs on top
+ * of overlayfs's own 256-byte path buffers. Measured 3388 of 4096 in use after
+ * persistence was added, leaving too little room for anything new. */
+K_THREAD_DEFINE(ntp_sync_tid, 8192, ntp_sync_thread, NULL, NULL, NULL, 7, 0, 0);
