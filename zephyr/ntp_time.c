@@ -24,6 +24,9 @@ static const char ntp_server[] = CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_SERVER
  * a manually set time is not overwritten. */
 extern bool ntp_is_enabled(void);
 
+/* Defined in timedated_main.cpp. Given when the switch state is first known. */
+extern struct k_sem ntp_mode_known;
+
 /* Addresses set from the web UI / Redfish, in the order they were given,
  * written by ntp_config.cpp through ntp_set_user_servers(). The count is 0
  * when nothing is set, and ntp_server above is then the only server.
@@ -91,8 +94,9 @@ static void save_user_servers(const char list[][NTP_USER_SERVER_MAX],
 	}
 }
 
-/* Set once the file has been looked at, so the sync thread and the property
- * initialiser can both ask for it without racing or re-reading. */
+/* Set only once the load reached a final outcome (list parsed, file empty, or
+ * nothing saved yet), under userServerLock. A transient I/O error leaves it
+ * clear so a later round retries. */
 static bool userServersLoaded;
 
 /* Restore the list saved by a previous run. The sync thread calls it before its
@@ -107,34 +111,46 @@ static void load_user_servers(void)
 	int count = 0;
 	int rc;
 
+	/* Held across the read: a caller arriving while the parse runs would
+	 * otherwise see the flag and get a half-filled list. This runs once at
+	 * boot, so holding it across flash I/O is fine. */
+	k_mutex_lock(&userServerLock, K_FOREVER);
+
 	if (userServersLoaded) {
+		k_mutex_unlock(&userServerLock);
 		return;
 	}
-	userServersLoaded = true;
 
 	fs_file_t_init(&f);
 
 	rc = fs_open(&f, NTP_USER_SERVER_PATH, FS_O_READ);
 	if (rc != 0) {
-		/* -ENOENT just means nothing has been saved yet. */
-		if (rc != -ENOENT) {
+		if (rc == -ENOENT) {
+			/* Nothing has been saved yet: a final state. */
+			userServersLoaded = true;
+		} else {
+			/* Transient: leave the flag clear so a later round
+			 * retries instead of losing the saved list for this
+			 * boot. */
 			printk("[ntp] cannot read the saved server list (%d)\n",
 			       rc);
 		}
+		k_mutex_unlock(&userServerLock);
 		return;
 	}
 	n = fs_read(&f, buf, sizeof(buf) - 1);
 	fs_close(&f);
 	if (n < 0) {
 		printk("[ntp] cannot read the saved server list (%d)\n", (int)n);
+		k_mutex_unlock(&userServerLock);
 		return;
 	}
 	if (n == 0) {
+		userServersLoaded = true;
+		k_mutex_unlock(&userServerLock);
 		return; /* empty file */
 	}
 	buf[n] = '\0';
-
-	k_mutex_lock(&userServerLock, K_FOREVER);
 
 	line = buf;
 	while (*line != '\0' && count < NTP_MAX_SERVERS) {
@@ -165,6 +181,7 @@ static void load_user_servers(void)
 	}
 
 	userServerCount = count;
+	userServersLoaded = true;
 	k_mutex_unlock(&userServerLock);
 }
 
@@ -346,10 +363,37 @@ static int query_once(const char *host, struct sntp_time *out)
 	return rc;
 }
 
+/* Report how far the clock moved, so a large correction stands out from the
+ * millisecond drift of an ordinary hourly resync. deltaUs is new - old: a
+ * positive value means the clock was behind and we moved it forward. */
+static void print_clock_delta(int64_t deltaUs)
+{
+	int64_t absUs = deltaUs < 0 ? -deltaUs : deltaUs;
+	const char *direction = deltaUs < 0 ? "ahead" : "behind";
+
+	if (absUs < 1000) {
+		printk("[ntp] clock was %lld us %s\n", (long long)absUs,
+		       direction);
+	} else if (absUs < 1000000) {
+		printk("[ntp] clock was %lld.%03lld ms %s\n",
+		       (long long)(absUs / 1000), (long long)(absUs % 1000),
+		       direction);
+	} else {
+		printk("[ntp] clock was %lld.%03lld s %s",
+		       (long long)(absUs / 1000000),
+		       (long long)((absUs % 1000000) / 1000), direction);
+		if (absUs >= 86400LL * 1000000) {
+			printk(" (~%lld days)",
+			       (long long)(absUs / (86400LL * 1000000)));
+		}
+		printk("\n");
+	}
+}
+
 /* Write the current system time to the hardware RTC.
  *
- * Duplicates rtc_shell.c and timedated_main.cpp; the three copies should be
- * merged into a single helper in app/src/rtc_time.c. */
+ * Duplicates timedated_main.cpp; the two copies should be merged into a single
+ * helper in app/src/rtc_time.c. */
 static void write_rtc_from_system(void)
 {
 	const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc));
@@ -416,6 +460,13 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		       CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT);
 	}
 
+	/* Wait until the switch state is known. The default is "on", and the
+	 * persisted mode only reaches timedated from manager.cpp about 15 s
+	 * into boot, so without this wait a manual-mode boot would sync once
+	 * before that. The timeout keeps NTP working if the mode never
+	 * arrives (settings-manager failed to start). */
+	(void)k_sem_take(&ntp_mode_known, K_SECONDS(30));
+
 	for (;;) {
 		uint32_t wait_sec = NTP_RESYNC_SEC;
 		char userbuf[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
@@ -424,9 +475,12 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		int i;
 		int rc;
 
-		/* Skip while NTP is switched off (manual mode). */
+		/* Skip while NTP is switched off (manual mode). Wait on the
+		 * wake semaphore rather than sleeping, so switching NTP back
+		 * on takes effect at once, not after NTP_NET_WAIT_SEC. */
 		if (!ntp_is_enabled()) {
-			k_sleep(K_SECONDS(NTP_NET_WAIT_SEC));
+			(void)k_sem_take(&ntp_wake_sem,
+					 K_SECONDS(NTP_NET_WAIT_SEC));
 			continue;
 		}
 
@@ -455,6 +509,11 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		rc = -EINVAL;
 
 		for (i = 0; i < n_user; i++) {
+			/* Stop the round as soon as the switch goes off, so
+			 * the remaining servers are not queried for nothing. */
+			if (!ntp_is_enabled()) {
+				break;
+			}
 			rc = query_once(userbuf[i], &ts);
 			if (rc == 0) {
 				host = userbuf[i];
@@ -463,8 +522,9 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 			printk("[ntp] %s unreachable (%d)\n", userbuf[i], rc);
 		}
 
-		/* Only worth falling back when a built-in server exists. */
-		if (rc != 0 && sizeof(ntp_server) > 1) {
+		/* Only worth falling back when a built-in server exists and
+		 * the switch is still on. */
+		if (rc != 0 && ntp_is_enabled() && sizeof(ntp_server) > 1) {
 			if (n_user > 0) {
 				printk("[ntp] no user server answered, fallback to %s\n",
 				       ntp_server);
@@ -473,7 +533,12 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 			rc = query_once(host, &ts);
 		}
 
-		if (rc != 0) {
+		if (!ntp_is_enabled()) {
+			/* Switched off while the round was running. Dropped
+			 * silently: no failure counted, no clock write. This
+			 * also covers a switch-off during a query. */
+			wait_sec = NTP_RETRY_SEC;
+		} else if (rc != 0) {
 			failures++;
 			if (failures <= NTP_LOUD_FAILURES) {
 				printk("[ntp] query failed (%d/%d), retry in %ds\n",
@@ -498,12 +563,15 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 			       (unsigned long long)ts.seconds, host);
 			wait_sec = NTP_RETRY_SEC;
 		} else if (!ntp_is_enabled()) {
-			/* NTP was switched off while the query was in flight.
-			 * Re-checked here because the check at the top of the
-			 * loop happened before the query. */
+			/* Off since the check above: a manually set time must
+			 * never be overwritten. */
 			printk("[ntp] disabled during query, skip write\n");
 			wait_sec = NTP_RETRY_SEC;
 		} else {
+			struct timespec before = {0};
+			bool haveBefore =
+				(clock_gettime(CLOCK_REALTIME, &before) == 0);
+
 			tspec.tv_sec = (time_t)ts.seconds;
 			tspec.tv_nsec =
 				((uint64_t)ts.fraction * NSEC_PER_SEC) >> 32;
@@ -514,6 +582,16 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 			} else {
 				printk("[ntp] synced to %llu via %s\n",
 				       (unsigned long long)ts.seconds, host);
+				if (haveBefore) {
+					int64_t newUs =
+						(int64_t)tspec.tv_sec * 1000000 +
+						tspec.tv_nsec / 1000;
+					int64_t oldUs =
+						(int64_t)before.tv_sec * 1000000 +
+						before.tv_nsec / 1000;
+
+					print_clock_delta(newUs - oldUs);
+				}
 				failures = 0;
 				write_rtc_from_system();
 			}
@@ -521,7 +599,13 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 
 		/* Returns 0 when woken by ntp_wake(), -EAGAIN on timeout. */
 		if (k_sem_take(&ntp_wake_sem, K_SECONDS(wait_sec)) == 0) {
-			printk("[ntp] woken, resync now\n");
+			/* Say what the wake leads to: with NTP off the next round
+			 * only idles, so a plain "resyncing now" would be wrong. */
+			if (ntp_is_enabled()) {
+				printk("[ntp] wake received, resyncing now\n");
+			} else {
+				printk("[ntp] wake received, NTP is off, staying idle\n");
+			}
 			/* The user changed the address or the switch, so the
 			 * next failures deserve to be reported again. */
 			failures = 0;

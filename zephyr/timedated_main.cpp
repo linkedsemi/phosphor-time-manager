@@ -26,6 +26,8 @@
 
 #include <atomic>
 #include <memory>
+#include <string>
+#include <variant>
 
 /* Defined in app/src/task_def.cpp */
 extern struct k_sem timedated_ready_sem;
@@ -44,6 +46,12 @@ extern "C" void ntp_wake(void);
 /* NTP switch state. Read and written over D-Bus by the web UI / Redfish, and
  * read by the ntp_time.c sync thread. Enabled by default. */
 static std::atomic<bool> ntpEnabled{true};
+
+/* Given when the switch state is first known: either the boot restore (the
+ * persisted mode reaches manager.cpp, which calls SetNTP) or a user toggle.
+ * ntp_time.c waits on it before its first round, because the default above is
+ * "on" and the persisted mode only arrives about 15 s into boot. */
+K_SEM_DEFINE(ntp_mode_known, 0, 1);
 
 extern "C" bool ntp_is_enabled(void)
 {
@@ -102,6 +110,40 @@ static void write_rtc_from_system(void)
 	       tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+/* Mirror the switch into the setting phosphor-time-manager reads at boot, so
+ * that turning NTP off survives a reboot. settings-manager is what persists it
+ * (its directory is on /overlay, see the mako template).
+ *
+ * Writing this fires PropertiesChanged, which manager.cpp turns back into a
+ * SetNTP call. The callers only persist when the value actually changed, which
+ * is what stops that from looping. */
+static void persist_ntp_mode(sdbusplus::asio::connection& conn, bool enabled)
+{
+	constexpr const char* settingPath =
+		"/xyz/openbmc_project/time/sync_method";
+	constexpr const char* settingIntf =
+		"xyz.openbmc_project.Time.Synchronization";
+
+	static const std::string ntpMode =
+		"xyz.openbmc_project.Time.Synchronization.Method.NTP";
+	static const std::string manualMode =
+		"xyz.openbmc_project.Time.Synchronization.Method.Manual";
+
+	try
+	{
+		std::variant<std::string> mode(enabled ? ntpMode : manualMode);
+		auto method = conn.new_method_call(
+			"xyz.openbmc_project.Settings", settingPath,
+			"org.freedesktop.DBus.Properties", "Set");
+		method.append(settingIntf, "TimeSyncMethod", mode);
+		conn.call(method);
+	}
+	catch (const std::exception& e)
+	{
+		printk("[timedated] cannot save the NTP mode: %s\n", e.what());
+	}
+}
+
 /* systemd semantics: while NTP is on, a manually set time would be overwritten
  * by the next sync, so the request is refused instead. bmcweb maps this error
  * name to a Redfish propertyValueConflict. */
@@ -140,10 +182,19 @@ static void timedated_setup(boost::asio::io_context& io, sd_bus* sdbus,
 	iface->register_property_rw<bool>(
 		"NTP", ntpEnabled.load(),
 		sdbusplus::vtable::property_::emits_change,
-		[](const bool& req, const bool& /*cur*/) {
-			ntpEnabled.store(req);
-			printk("[timedated] NTP -> %s\n",
-			       req ? "true" : "false");
+		[bus](const bool& req, const bool& /*cur*/) {
+			/* Only speak when the value really changes: persist
+			 * writes the setting back, which bounces through
+			 * manager.cpp into a second SetNTP for the same
+			 * value. */
+			if (ntpEnabled.exchange(req) != req)
+			{
+				persist_ntp_mode(*bus, req);
+				printk("[timedated] NTP %s\n",
+				       req ? "on, will sync from a server"
+					   : "off, time is manual");
+			}
+			k_sem_give(&ntp_mode_known);
 			/* Wake the sync thread so the new state takes effect
 			 * now instead of after a full resync period. */
 			ntp_wake();
@@ -154,10 +205,18 @@ static void timedated_setup(boost::asio::io_context& io, sd_bus* sdbus,
 	/* SetNTP(bool ntpEnabled, bool user_interaction) -- same as above. */
 	iface->register_method(
 		"SetNTP",
-		[](const bool& enabled, const bool& /*userInteraction*/) {
-			ntpEnabled.store(enabled);
-			printk("[timedated] SetNTP(%s)\n",
-			       enabled ? "true" : "false");
+		[bus](const bool& enabled, const bool& /*userInteraction*/) {
+			if (ntpEnabled.exchange(enabled) != enabled)
+			{
+				persist_ntp_mode(*bus, enabled);
+				/* Plain wording rather than the raw D-Bus
+				 * argument: SetNTP(false) on its own reads
+				 * like "sync now". */
+				printk("[timedated] NTP %s\n",
+				       enabled ? "on, will sync from a server"
+					       : "off, time is manual");
+			}
+			k_sem_give(&ntp_mode_known);
 			ntp_wake();
 		});
 
