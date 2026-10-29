@@ -6,14 +6,16 @@
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/sntp.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/posix/time.h>
-#include <zephyr/sys/printk.h>
 
 /* ntp_set_user_server() is defined below and called from ntp_config.cpp. */
 #include "ntp_config.h"
+
+LOG_MODULE_REGISTER(ntp, LOG_LEVEL_INF);
 
 /* From zephyr/Kconfig. sizeof("") == 1, so the array size tells at compile
  * time whether a default server was configured. This is the built-in address:
@@ -67,8 +69,8 @@ static void save_user_servers(const char list[][NTP_USER_SERVER_MAX],
 
 	if (fs_open(&f, NTP_USER_SERVER_PATH,
 		    FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC) != 0) {
-		printk("[ntp] cannot save the server list; keeping the previous "
-		       "one\n");
+		LOG_ERR("cannot save the server list; keeping the previous "
+			"one");
 		return;
 	}
 
@@ -86,11 +88,11 @@ static void save_user_servers(const char list[][NTP_USER_SERVER_MAX],
 		 * truncated list, so drop it: the Kconfig default is a better
 		 * answer than a list nobody typed. */
 		(void)fs_unlink(NTP_USER_SERVER_PATH);
-		printk("[ntp] cannot save the server list (%d); removed the saved "
-		       "one so the built-in server is used after a reboot\n",
-		       closed);
-		printk("[ntp] set the servers again in the web UI (Settings -> "
-		       "Date & Time) to retry saving them\n");
+		LOG_ERR("cannot save the server list (%d); removed the saved "
+			"one so the built-in server is used after a reboot",
+			closed);
+		LOG_INF("set the servers again in the web UI (Settings -> "
+			"Date & Time) to retry saving them");
 	}
 }
 
@@ -132,8 +134,7 @@ static void load_user_servers(void)
 			/* Transient: leave the flag clear so a later round
 			 * retries instead of losing the saved list for this
 			 * boot. */
-			printk("[ntp] cannot read the saved server list (%d)\n",
-			       rc);
+			LOG_ERR("cannot read the saved server list (%d)", rc);
 		}
 		k_mutex_unlock(&userServerLock);
 		return;
@@ -141,7 +142,7 @@ static void load_user_servers(void)
 	n = fs_read(&f, buf, sizeof(buf) - 1);
 	fs_close(&f);
 	if (n < 0) {
-		printk("[ntp] cannot read the saved server list (%d)\n", (int)n);
+		LOG_ERR("cannot read the saved server list (%d)", (int)n);
 		k_mutex_unlock(&userServerLock);
 		return;
 	}
@@ -170,7 +171,7 @@ static void load_user_servers(void)
 		if (line[0] != '\0') {
 			snprintf(userServer[count], NTP_USER_SERVER_MAX, "%s",
 				 line);
-			printk("[ntp] restored server %s\n", userServer[count]);
+			LOG_INF("restored server %s", userServer[count]);
 			count++;
 		}
 
@@ -225,14 +226,12 @@ void ntp_set_user_servers(const char *const *servers, int count)
 	 * caller ever appears, give save_user_servers() its own mutex. */
 	save_user_servers(snapshot, n);
 
-	printk("[ntp] user servers <-");
 	if (n == 0) {
-		printk(" (cleared)\n");
+		LOG_INF("user servers cleared");
 	} else {
 		for (i = 0; i < n; i++) {
-			printk(" %s", snapshot[i]);
+			LOG_INF("user server %d: %s", i, snapshot[i]);
 		}
-		printk("\n");
 	}
 
 	ntp_wake();
@@ -323,14 +322,14 @@ static int resolve_server(const char *host, struct in_addr *out)
 	/* service is NULL: the port comes from the caller's sockaddr_in. */
 	rc = zsock_getaddrinfo(host, NULL, &hints, &res);
 	if (rc != 0 || res == NULL) {
-		printk("[ntp] cannot resolve '%s' (getaddrinfo %d)\n", host, rc);
+		LOG_ERR("cannot resolve '%s' (getaddrinfo %d)", host, rc);
 		return -EINVAL;
 	}
 
 	*out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
 	zsock_freeaddrinfo(res);
 
-	printk("[ntp] resolved %s -> %s\n", host,
+	LOG_DBG("resolved %s -> %s", host,
 	       net_addr_ntop(AF_INET, out, buf, sizeof(buf)));
 
 	return 0;
@@ -353,7 +352,7 @@ static int query_once(const char *host, struct sntp_time *out)
 	}
 
 	if (sntp_init(&ctx, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-		printk("[ntp] sntp_init failed\n");
+		LOG_ERR("sntp_init failed");
 		return -EIO;
 	}
 
@@ -370,24 +369,25 @@ static void print_clock_delta(int64_t deltaUs)
 {
 	int64_t absUs = deltaUs < 0 ? -deltaUs : deltaUs;
 	const char *direction = deltaUs < 0 ? "ahead" : "behind";
+	char value[48];
 
 	if (absUs < 1000) {
-		printk("[ntp] clock was %lld us %s\n", (long long)absUs,
-		       direction);
+		snprintf(value, sizeof(value), "%lld us", (long long)absUs);
 	} else if (absUs < 1000000) {
-		printk("[ntp] clock was %lld.%03lld ms %s\n",
-		       (long long)(absUs / 1000), (long long)(absUs % 1000),
-		       direction);
+		snprintf(value, sizeof(value), "%lld.%03lld ms",
+			 (long long)(absUs / 1000), (long long)(absUs % 1000));
+	} else if (absUs < 86400LL * 1000000) {
+		snprintf(value, sizeof(value), "%lld.%03lld s",
+			 (long long)(absUs / 1000000),
+			 (long long)((absUs % 1000000) / 1000));
 	} else {
-		printk("[ntp] clock was %lld.%03lld s %s",
-		       (long long)(absUs / 1000000),
-		       (long long)((absUs % 1000000) / 1000), direction);
-		if (absUs >= 86400LL * 1000000) {
-			printk(" (~%lld days)",
-			       (long long)(absUs / (86400LL * 1000000)));
-		}
-		printk("\n");
+		snprintf(value, sizeof(value), "%lld.%03lld s (~%lld days)",
+			 (long long)(absUs / 1000000),
+			 (long long)((absUs % 1000000) / 1000),
+			 (long long)(absUs / (86400LL * 1000000)));
 	}
+
+	LOG_INF("clock was %s %s", value, direction);
 }
 
 /* Write the current system time to the hardware RTC.
@@ -402,15 +402,15 @@ static void write_rtc_from_system(void)
 	struct tm tm;
 
 	if (!device_is_ready(rtc)) {
-		printk("[ntp] rtc not ready, skip\n");
+		LOG_WRN("rtc not ready, skip");
 		return;
 	}
 	if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
-		printk("[ntp] clock_gettime failed\n");
+		LOG_ERR("clock_gettime failed");
 		return;
 	}
 	if (gmtime_r(&ts.tv_sec, &tm) == NULL) {
-		printk("[ntp] gmtime_r failed\n");
+		LOG_ERR("gmtime_r failed");
 		return;
 	}
 
@@ -423,11 +423,11 @@ static void write_rtc_from_system(void)
 	rtc_tm.tm_wday = tm.tm_wday;
 
 	if (rtc_set_time(rtc, &rtc_tm) != 0) {
-		printk("[ntp] rtc_set_time failed\n");
+		LOG_ERR("rtc_set_time failed");
 		return;
 	}
 
-	printk("[ntp] RTC <- %d-%02u-%02u %02u:%02u:%02u UTC\n",
+	LOG_DBG("RTC <- %d-%02u-%02u %02u:%02u:%02u UTC",
 	       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
 	       tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
@@ -451,13 +451,13 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		char saved[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
 
 		if (ntp_get_user_servers(saved, NTP_MAX_SERVERS) == 0) {
-			printk("[ntp] NTP_SERVER not configured, disabled\n");
+			LOG_WRN("NTP_SERVER not configured, disabled");
 			return;
 		}
-		printk("[ntp] no default server, using the saved list\n");
+		LOG_INF("no default server, using the saved list");
 	} else {
-		printk("[ntp] default server %s:%d\n", ntp_server,
-		       CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT);
+		LOG_INF("default server %s:%d", ntp_server,
+			CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT);
 	}
 
 	/* Wait until the switch state is known. The default is "on", and the
@@ -519,15 +519,15 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 				host = userbuf[i];
 				break;
 			}
-			printk("[ntp] %s unreachable (%d)\n", userbuf[i], rc);
+			LOG_WRN("%s unreachable (%d)", userbuf[i], rc);
 		}
 
 		/* Only worth falling back when a built-in server exists and
 		 * the switch is still on. */
 		if (rc != 0 && ntp_is_enabled() && sizeof(ntp_server) > 1) {
 			if (n_user > 0) {
-				printk("[ntp] no user server answered, fallback to %s\n",
-				       ntp_server);
+				LOG_INF("no user server answered, "
+					"fallback to %s", ntp_server);
 			}
 			host = ntp_server;
 			rc = query_once(host, &ts);
@@ -541,31 +541,32 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 		} else if (rc != 0) {
 			failures++;
 			if (failures <= NTP_LOUD_FAILURES) {
-				printk("[ntp] query failed (%d/%d), retry in %ds\n",
-				       failures, NTP_LOUD_FAILURES, NTP_RETRY_SEC);
+				LOG_WRN("query failed (%d/%d), retry in %ds",
+					failures, NTP_LOUD_FAILURES,
+					NTP_RETRY_SEC);
 				wait_sec = NTP_RETRY_SEC;
 			} else {
 				if (failures == NTP_LOUD_FAILURES + 1) {
-					printk("[ntp] no NTP server is reachable; "
-					       "switching to slow mode and retrying "
-					       "every %d min\n",
-					       NTP_SLOW_RETRY_SEC / 60);
-					printk("[ntp] set a server in the web UI "
-					       "(Settings -> Date & Time) to sync "
-					       "right away\n");
+					LOG_ERR("no NTP server is reachable; "
+						"switching to slow mode and "
+						"retrying every %d min",
+						NTP_SLOW_RETRY_SEC / 60);
+					LOG_INF("set a server in the web UI "
+						"(Settings -> Date & Time) to "
+						"sync right away");
 				}
 				wait_sec = NTP_SLOW_RETRY_SEC;
 			}
 		} else if (ts.seconds < NTP_MIN_VALID_EPOCH ||
 			   ts.seconds > NTP_MAX_VALID_EPOCH) {
 			/* Implausible value: no system time, and no RTC write. */
-			printk("[ntp] implausible %llu from %s, ignored\n",
-			       (unsigned long long)ts.seconds, host);
+			LOG_ERR("implausible %llu from %s, ignored",
+				(unsigned long long)ts.seconds, host);
 			wait_sec = NTP_RETRY_SEC;
 		} else if (!ntp_is_enabled()) {
 			/* Off since the check above: a manually set time must
 			 * never be overwritten. */
-			printk("[ntp] disabled during query, skip write\n");
+			LOG_INF("disabled during query, skip write");
 			wait_sec = NTP_RETRY_SEC;
 		} else {
 			struct timespec before = {0};
@@ -577,11 +578,11 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 				((uint64_t)ts.fraction * NSEC_PER_SEC) >> 32;
 
 			if (clock_settime(CLOCK_REALTIME, &tspec) != 0) {
-				printk("[ntp] clock_settime failed\n");
+				LOG_ERR("clock_settime failed");
 				wait_sec = NTP_RETRY_SEC;
 			} else {
-				printk("[ntp] synced to %llu via %s\n",
-				       (unsigned long long)ts.seconds, host);
+				LOG_INF("synced to %llu via %s",
+					(unsigned long long)ts.seconds, host);
 				if (haveBefore) {
 					int64_t newUs =
 						(int64_t)tspec.tv_sec * 1000000 +
@@ -602,9 +603,10 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 			/* Say what the wake leads to: with NTP off the next round
 			 * only idles, so a plain "resyncing now" would be wrong. */
 			if (ntp_is_enabled()) {
-				printk("[ntp] wake received, resyncing now\n");
+				LOG_INF("wake received, resyncing now");
 			} else {
-				printk("[ntp] wake received, NTP is off, staying idle\n");
+				LOG_INF("wake received, NTP is off, "
+					"staying idle");
 			}
 			/* The user changed the address or the switch, so the
 			 * next failures deserve to be reported again. */
@@ -613,7 +615,8 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 	}
 }
 
-/* 8192, not 4096: the deepest path is the start-up restore, which runs on top
- * of overlayfs's own 256-byte path buffers. Measured 3388 of 4096 in use after
- * persistence was added, leaving too little room for anything new. */
-K_THREAD_DEFINE(ntp_sync_tid, 8192, ntp_sync_thread, NULL, NULL, NULL, 7, 0, 0);
+/* 16384, not 8192: the deepest path is socket receive inside sntp_query(),
+ * which runs the network stack on this thread's stack. A fault dump showed sp
+ * 2880 bytes below an 8192-byte stack, so the old size was too small; the
+ * start-up restore over overlayfs adds to the same budget. */
+K_THREAD_DEFINE(ntp_sync_tid, 16384, ntp_sync_thread, NULL, NULL, NULL, 7, 0, 0);
