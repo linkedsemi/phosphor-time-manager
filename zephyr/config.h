@@ -9,8 +9,6 @@
 
 #include "types.hpp"
 
-#if defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_DEFAULT_MODE_NTP)
+/* NTP is the only built-in default. Manual is a runtime choice: it lives in
+ * the Time.Synchronization setting and is restored from there at boot. */
 #define DEFAULT_TIME_MODE Mode::NTP
-#else
-#define DEFAULT_TIME_MODE Mode::Manual
-#endif

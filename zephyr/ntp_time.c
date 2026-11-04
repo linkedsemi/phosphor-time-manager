@@ -39,11 +39,12 @@ static char userServer[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
 static int userServerCount;
 static K_MUTEX_DEFINE(userServerLock);
 
-/* The list is saved under /overlay, the writable filesystem on this image
- * (there is no /var), one address per line. It is written on every change,
- * which only happens when a user sets one, so the blocking littlefs write is
- * not on a hot path. */
-#define NTP_USER_SERVER_DIR  "/overlay/var/lib/phosphor-time-manager"
+/* The list is saved on the eMMC data volume, one address per line, rather
+ * than under /overlay: flashing the BMC rewrites the QSPI app and rofs
+ * partitions but leaves /mnt alone, so a user's server list survives a
+ * firmware update. It is written on every change, which only happens when a
+ * user sets one, so the blocking write is not on a hot path. */
+#define NTP_USER_SERVER_DIR  "/mnt/var/lib/phosphor-time-manager"
 #define NTP_USER_SERVER_PATH NTP_USER_SERVER_DIR "/ntp_server"
 
 /* fs_write() is allowed to return fewer bytes than asked for. littlefs does not
