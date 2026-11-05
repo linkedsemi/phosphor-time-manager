@@ -43,9 +43,27 @@ void ntp_config_register(sdbusplus::asio::connection& bus,
  * The other wake path is a server address change, in ntp_set_user_server(). */
 extern "C" void ntp_wake(void);
 
+#if !defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP)
+/* This build has no SNTP client, but timedated still calls both helpers
+ * unconditionally, so provide the no-op versions here. */
+void ntp_config_register(sdbusplus::asio::connection&,
+			 sdbusplus::asio::object_server&)
+{
+}
+
+extern "C" void ntp_wake(void)
+{
+}
+#endif
+
 /* NTP switch state. Read and written over D-Bus by the web UI / Redfish, and
- * read by the ntp_time.c sync thread. Enabled by default. */
+ * read by the ntp_time.c sync thread. Enabled by default when the client is
+ * compiled in; without it the switch starts off, matching DEFAULT_TIME_MODE. */
+#if defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP)
 static std::atomic<bool> ntpEnabled{true};
+#else
+static std::atomic<bool> ntpEnabled{false};
+#endif
 
 /* Given when the switch state is first known: either the boot restore (the
  * persisted mode reaches manager.cpp, which calls SetNTP) or a user toggle.
@@ -55,7 +73,27 @@ K_SEM_DEFINE(ntp_mode_known, 0, 1);
 
 extern "C" bool ntp_is_enabled(void)
 {
+#if defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP)
 	return ntpEnabled.load();
+#else
+	/* No sync client in this build: the time is always manual, so SetTime
+	 * must not be refused and nothing should claim NTP is running. */
+	return false;
+#endif
+}
+
+/* What the switch may actually become. Without an SNTP client nothing can
+ * sync, so writes are clamped to "off" instead of storing an NTP request the
+ * getter would then deny: manager.cpp restores the persisted mode at boot and
+ * calls SetNTP, and a divergent atomic would make SetTime throw forever. */
+static bool ntp_accepts(bool requested)
+{
+#if defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP)
+	return requested;
+#else
+	(void)requested;
+	return false;
+#endif
 }
 
 /* Accepted range for SetTime. The bounds are the limits of the IPMI SEL
@@ -187,12 +225,13 @@ static void timedated_setup(boost::asio::io_context& io, sd_bus* sdbus,
 			 * writes the setting back, which bounces through
 			 * manager.cpp into a second SetNTP for the same
 			 * value. */
-			if (ntpEnabled.exchange(req) != req)
+			const bool want = ntp_accepts(req);
+			if (ntpEnabled.exchange(want) != want)
 			{
-				persist_ntp_mode(*bus, req);
+				persist_ntp_mode(*bus, want);
 				printk("[timedated] NTP %s\n",
-				       req ? "on, will sync from a server"
-					   : "off, time is manual");
+				       want ? "on, will sync from a server"
+					    : "off, time is manual");
 			}
 			k_sem_give(&ntp_mode_known);
 			/* Wake the sync thread so the new state takes effect
@@ -200,21 +239,22 @@ static void timedated_setup(boost::asio::io_context& io, sd_bus* sdbus,
 			ntp_wake();
 			return true;
 		},
-		[](const bool& /*cur*/) { return ntpEnabled.load(); });
+		[](const bool& /*cur*/) { return ntp_is_enabled(); });
 
 	/* SetNTP(bool ntpEnabled, bool user_interaction) -- same as above. */
 	iface->register_method(
 		"SetNTP",
 		[bus](const bool& enabled, const bool& /*userInteraction*/) {
-			if (ntpEnabled.exchange(enabled) != enabled)
+			const bool want = ntp_accepts(enabled);
+			if (ntpEnabled.exchange(want) != want)
 			{
-				persist_ntp_mode(*bus, enabled);
+				persist_ntp_mode(*bus, want);
 				/* Plain wording rather than the raw D-Bus
 				 * argument: SetNTP(false) on its own reads
 				 * like "sync now". */
 				printk("[timedated] NTP %s\n",
-				       enabled ? "on, will sync from a server"
-					       : "off, time is manual");
+				       want ? "on, will sync from a server"
+					    : "off, time is manual");
 			}
 			k_sem_give(&ntp_mode_known);
 			ntp_wake();
@@ -233,7 +273,11 @@ static void timedated_setup(boost::asio::io_context& io, sd_bus* sdbus,
 		   const bool& /*userInteraction*/) {
 			struct timespec ts;
 
-			if (ntpEnabled.load()) {
+			/* ntp_is_enabled(), not the raw atomic: they are
+			 * deliberately the same value now, but this is the
+			 * question being asked, and it stays right if a build
+			 * ever forces the switch off. */
+			if (ntp_is_enabled()) {
 				throwAutomaticTimeSyncEnabled();
 			}
 			if (relative) {

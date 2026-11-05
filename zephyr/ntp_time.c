@@ -39,11 +39,13 @@ static char userServer[NTP_MAX_SERVERS][NTP_USER_SERVER_MAX];
 static int userServerCount;
 static K_MUTEX_DEFINE(userServerLock);
 
-/* The list is saved under /overlay, the writable filesystem on this image
- * (there is no /var), one address per line. It is written on every change,
- * which only happens when a user sets one, so the blocking littlefs write is
- * not on a hot path. */
-#define NTP_USER_SERVER_DIR  "/overlay/var/lib/phosphor-time-manager"
+/* The list is saved on the eMMC data volume, one address per line, rather
+ * than under /overlay: flashing the BMC rewrites the QSPI app and rofs
+ * partitions but leaves that volume alone, so a user's server list survives a
+ * firmware update. The mount point comes from Kconfig, like SW_IMAGE_PATH in
+ * phosphor-bmc-code-mgt. It is written on every change, which only happens
+ * when a user sets one, so the blocking write is not on a hot path. */
+#define NTP_USER_SERVER_DIR  CONFIG_FS_ROOT_MNT "/var/lib/phosphor-time-manager"
 #define NTP_USER_SERVER_PATH NTP_USER_SERVER_DIR "/ntp_server"
 
 /* fs_write() is allowed to return fewer bytes than asked for. littlefs does not
@@ -618,5 +620,5 @@ static void ntp_sync_thread(void *p1, void *p2, void *p3)
 /* 16384, not 8192: the deepest path is socket receive inside sntp_query(),
  * which runs the network stack on this thread's stack. A fault dump showed sp
  * 2880 bytes below an 8192-byte stack, so the old size was too small; the
- * start-up restore over overlayfs adds to the same budget. */
+ * start-up restore of the saved server list adds to the same budget. */
 K_THREAD_DEFINE(ntp_sync_tid, 16384, ntp_sync_thread, NULL, NULL, NULL, 7, 0, 0);

@@ -9,7 +9,10 @@
 
 #include "types.hpp"
 
-#if defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_DEFAULT_MODE_NTP)
+/* NTP is the built-in default only when the client is compiled in. Without
+ * it the firmware can do nothing but manual time setting, so claiming NTP
+ * would leave manager.cpp and timedated disagreeing about the mode. */
+#if defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP)
 #define DEFAULT_TIME_MODE Mode::NTP
 #else
 #define DEFAULT_TIME_MODE Mode::Manual
