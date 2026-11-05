@@ -5,6 +5,7 @@ config OPENBMC_PHOSPHOR_TIME_MANAGER_NTP
     bool "SNTP client (NTP time sync)"
     default y
     depends on OPENBMC_PHOSPHOR_TIME_MANAGER
+    depends on SNTP
     help
       Build zephyr/ntp_time.c (the SNTP client thread) and
       zephyr/ntp_config.cpp (the D-Bus object that stores the server list).
@@ -19,7 +20,8 @@ config OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_SERVER
     depends on OPENBMC_PHOSPHOR_TIME_MANAGER_NTP
     help
       NTP server address, either an IPv4 literal or a host name. Leave it
-      empty to disable NTP sync; the thread in zephyr/ntp_time.c then exits.
+      empty to disable the built-in server; the sync thread then only polls
+      the servers the user stored through StaticNTPServers, if any.
 
 config OPENBMC_PHOSPHOR_TIME_MANAGER_NTP_PORT
     int
