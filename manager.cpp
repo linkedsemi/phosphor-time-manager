@@ -43,9 +43,19 @@ void Manager::onPropertyChanged(const std::string& key,
 {
     assert(key == propertyTimeMode);
 
+    std::string mode = value;
+#if !defined(CONFIG_OPENBMC_PHOSPHOR_TIME_MANAGER_NTP)
+    /* The stored setting's default is still NTP (settings_example.yaml is
+     * shared by every build), and getSetting() returns it during start-up,
+     * overriding DEFAULT_TIME_MODE. Without the SNTP client only manual can
+     * run, so ignore what the setting says instead of claiming a mode this
+     * firmware cannot enter. */
+    mode = utils::modeToStr(Mode::Manual);
+#endif
+
     // Notify listeners
-    setCurrentTimeMode(value);
-    onTimeModeChanged(value);
+    setCurrentTimeMode(mode);
+    onTimeModeChanged(mode);
 }
 
 int Manager::onSettingsChanged(sdbusplus::message_t& msg)
